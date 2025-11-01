@@ -479,6 +479,28 @@ parser.add_argument('--save_uniformat_max_dataset_length',
                     default=800,
                     help='if the dataset is too long, subsample to this length')
 
+parser.add_argument('--dataset',
+                    type=str,
+                    help='')
+parser.add_argument('--dataset_root',
+                    type=str,
+                    help='')
+parser.add_argument('--img_height',
+                    type=str,
+                    help='')
+parser.add_argument('--img_width',
+                    type=str,
+                    help='')
+parser.add_argument('--method',
+                    type=str)
+parser.add_argument('--split',
+                    type=str)
+parser.add_argument('--camera',
+                    default='d435')
+parser.add_argument('--output_root',
+                    default='/data/robotarm/result/depth/mixed',
+                    type=str)
+
 args = parser.parse_args()
 args.num_gpus = len(args.gpus.split(','))
 
