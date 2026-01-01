@@ -120,7 +120,7 @@ def infer_depth_path_and_scale(dataset, dataset_root, rgb_rel_path, camera):
         frame = int(rgb_rel_path.split('/')[-2])
         if camera == 'd435':
             dpth = os.path.join(dataset_root, dataset, 'scenes', scene, f'{frame}', 'depth1.png')
-        else:
+        elif camera == 'l515':
             dpth = os.path.join(dataset_root, dataset, 'scenes', scene, f'{frame}', 'depth2.png')
         scale = 1.0
     elif dataset == 'GN-Trans':
@@ -143,9 +143,78 @@ def infer_depth_path_and_scale(dataset, dataset_root, rgb_rel_path, camera):
         frame = int(os.path.splitext(os.path.basename(rgb_rel_path))[0])
         dpth = os.path.join(dataset_root, dataset, 'test_primesense', scene, 'depth', f'{frame:06d}.png')
         scale = 0.1
+    elif dataset == 'ROBI':
+        scale = 0.03125
+        dpth = os.path.join(dataset_root, dataset, rgb_rel_path.replace("Stereo", "Depth").replace('LEFT_', 'DEPTH_').replace('.bmp', '.png'))
     else:
         raise NotImplementedError(f"Unknown dataset: {dataset}")
     return dpth, scale
+
+import time
+def benchmark_inference(model,
+                        example_inputs,
+                        device='cuda',
+                        n_warmup=10,
+                        n_iters=50):
+    """
+    精确测 PyTorch 模型单次 forward 时间（不含数据加载等开销）
+
+    model: 已构建好的 nn.Module
+    example_inputs: 和真实推理时 shape 一致的输入 tensor（或 tuple/list of tensors）
+    device: 'cuda' or 'cpu'
+    n_warmup: 预热次数（不计时）
+    n_iters: 正式计时的迭代次数
+    """
+    assert device in ['cuda', 'cpu']
+
+    # 关闭梯度
+    torch.set_grad_enabled(False)
+
+    # -------- warm-up，不计时 --------
+    for _ in range(n_warmup):
+        _ = model(example_inputs)
+    if device == 'cuda':
+        torch.cuda.synchronize()
+
+    times_ms = []
+
+    # -------- 正式计时 --------
+    if device == 'cuda':
+        starter = torch.cuda.Event(enable_timing=True)
+        ender   = torch.cuda.Event(enable_timing=True)
+
+        for _ in range(n_iters):
+            starter.record()
+            _ = model(example_inputs)
+            ender.record()
+            torch.cuda.synchronize()              # 等 GPU 完成
+            times_ms.append(starter.elapsed_time(ender))  # 单位: ms
+    else:
+        for _ in range(n_iters):
+            t0 = time.perf_counter()
+            _ = model(example_inputs)
+            t1 = time.perf_counter()
+            times_ms.append((t1 - t0) * 1000.0)   # s -> ms
+
+    times = torch.tensor(times_ms)
+    mean_ms = times.mean().item()
+    std_ms  = times.std(unbiased=False).item()
+
+    # batch 维度（用于算 per-image 时间 / FPS）
+    if torch.is_tensor(example_inputs):
+        batch_size = example_inputs.size(0)
+    elif isinstance(example_inputs, (list, tuple)) and torch.is_tensor(example_inputs[0]):
+        batch_size = example_inputs[0].size(0)
+    else:
+        batch_size = 1
+
+    print(f"[{device}] {n_iters} runs, batch_size={batch_size}")
+    print(f"  mean  : {mean_ms:.3f} ms / batch")
+    print(f"  std   : {std_ms:.3f} ms")
+    print(f"  per-img: {mean_ms / batch_size:.3f} ms")
+    print(f"  FPS   : {1000.0 / (mean_ms / batch_size):.2f}")
+
+    return mean_ms, std_ms, times_ms
 
 # ----------------------------
 # 主推断（多数据集，读取 split）
@@ -186,8 +255,6 @@ def test_mixed(args):
 
     # 4) 推断循环
     depth_factor_mm = 1000.0  # 保存为 uint16 毫米
-    save_root = os.path.join(args.output_root, args.dataset, args.method)
-    os.makedirs(save_root, exist_ok=True)
 
     diviser = int(4 * 2 ** (args.num_resolution - 1))  # 与 demo 中一致
 
@@ -212,6 +279,8 @@ def test_mixed(args):
             rgb_np = np.array(Image.open(rgb_path))
             if rgb_np.ndim == 3 and rgb_np.shape[2] == 4:
                 rgb_np = rgb_np[:, :, :3]
+            elif rgb_np.ndim == 2:
+                rgb_np = np.repeat(rgb_np[..., None], 3, axis=2)
             dep_raw = np.array(Image.open(depth_path)).astype(np.float32) * dscale * 1e-3  # -> 米
         except Exception as e:
             print('[Error] read image/depth failed:', rgb_path, depth_path, e)
@@ -247,6 +316,8 @@ def test_mixed(args):
             sample['dep'] = dep
 
         # 前向
+        # print(sample['rgb'].shape)
+        # benchmark_inference(net, sample, 'cuda', n_warmup=10, n_iters=50)
         with torch.no_grad():
             out = net(sample)
 
@@ -283,11 +354,17 @@ def test_mixed(args):
         elif args.dataset in ['XYZ-IBD', 'YCB-V', 'T-LESS']:
             scene = parts[1]
             frame_id = int(os.path.splitext(parts[-1])[0])
+        elif args.dataset in ['ROBI']:
+            scene = parts[1] + '_' + parts[2]
+            frame_id = int(parts[-1].split('.')[0].split('_')[-1])
         else:
             scene = parts[0]
             frame_id = int(os.path.splitext(parts[-1])[0])
 
-        save_dir = os.path.join(save_root, scene)
+        if args.dataset in ['HAMMER', 'TransCG']:
+            save_dir = os.path.join(args.output_root, args.dataset, args.camera, args.method, scene)
+        else:
+            save_dir = os.path.join(args.output_root, args.dataset, args.method, scene)
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, f'{frame_id:06d}_depth.png')
         Image.fromarray(pred_mm).save(save_path)
